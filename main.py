@@ -1,20 +1,25 @@
 import sys
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QColor, QIcon, QBrush, QFont
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFileDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QStatusBar, QMessageBox, QProgressBar, QSplitter, QFrame,
-    QGroupBox
+    QGroupBox, QCheckBox, QListWidget, QListWidgetItem, QInputDialog,
+    QAbstractItemView, QTabWidget, QSizePolicy, QTextEdit
 )
 
 from scanner import DiffItem, FileInfo
 from scan_thread import ScanThread
 from sync_thread import SyncThread, SyncTask
 from watch_thread import WatchThread
+from profiles import SyncProfile, ProfileManager
+from task_scheduler import TaskScheduler, ProfileResult
+from report_generator import generate_report
 
 
 COLOR_LEFT_ONLY = QColor(255, 200, 200)
@@ -27,6 +32,11 @@ COLOR_SYNC_COPYING = QColor(255, 235, 150)
 COLOR_SYNC_SYNCED = QColor(180, 240, 180)
 COLOR_SYNC_FAILED = QColor(255, 160, 160)
 COLOR_SYNC_SKIPPED = QColor(220, 220, 220)
+
+COLOR_QUEUE_WAITING = QColor(240, 248, 255)
+COLOR_QUEUE_RUNNING = QColor(255, 235, 150)
+COLOR_QUEUE_DONE = QColor(180, 240, 180)
+COLOR_QUEUE_ERROR = QColor(255, 160, 160)
 
 
 def format_size(size: int) -> str:
@@ -100,10 +110,18 @@ class MainWindow(QMainWindow):
     COL_SYNC_STATUS = 7
     COL_SYNC_PROGRESS = 8
 
+    QUEUE_COL_CHECK = 0
+    QUEUE_COL_NAME = 1
+    QUEUE_COL_SOURCE = 2
+    QUEUE_COL_TARGET = 3
+    QUEUE_COL_STATUS = 4
+    QUEUE_COL_PROGRESS = 5
+    QUEUE_COL_SUMMARY = 6
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("同步大师 (SyncMaster) - 专业文件夹对账与同步工具")
-        self.setMinimumSize(1300, 800)
+        self.setMinimumSize(1500, 900)
         self.scan_thread: ScanThread = None
         self.sync_thread: SyncThread = None
         self.watch_thread: WatchThread = None
@@ -112,7 +130,14 @@ class MainWindow(QMainWindow):
         self.diff_row_to_task: dict = {}
         self._pending_auto_sync_paths: list = None
         self._auto_sync_active: bool = False
+
+        self.profile_manager = ProfileManager()
+        self.task_scheduler: TaskScheduler = None
+        self.queue_results: list = []
+        self.profile_rows: dict = {}
+
         self._init_ui()
+        self._refresh_profile_list()
 
     def _init_ui(self):
         central = QWidget()
@@ -129,9 +154,50 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("color: #2c5aa0; margin-bottom: 6px;")
         main_layout.addWidget(title)
 
-        subtitle = QLabel("毫秒级差异对账 · 本地硬盘 / NAS / U 盘 增量备份助手")
+        subtitle = QLabel("毫秒级差异对账 · 多方案批量同步 · 对账审计报告自动生成")
         subtitle.setStyleSheet("color: #666; margin-bottom: 6px;")
         main_layout.addWidget(subtitle)
+
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #ddd; border-radius: 6px; }
+            QTabBar::tab {
+                padding: 10px 24px;
+                font-weight: bold;
+                font-size: 14px;
+                border: 1px solid #ddd;
+                border-bottom: none;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                background: #f5f5f5;
+                margin-right: 4px;
+            }
+            QTabBar::tab:selected {
+                background: #2c5aa0;
+                color: white;
+            }
+        """)
+
+        self.tabs.addTab(self._build_single_sync_tab(), "🔧 单方案对账同步")
+        self.tabs.addTab(self._build_multi_sync_tab(), "📋 多方案批量管理")
+
+        main_layout.addWidget(self.tabs, stretch=1)
+
+        self.statusbar = QStatusBar()
+        self.setStatusBar(self.statusbar)
+        self.status_label = QLabel("就绪")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(280)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(False)
+        self.statusbar.addWidget(self.status_label, stretch=1)
+        self.statusbar.addPermanentWidget(self.progress_bar)
+
+    def _build_single_sync_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(10)
+        layout.setContentsMargins(6, 10, 6, 6)
 
         path_group = QGroupBox("路径选择")
         path_layout = QVBoxLayout(path_group)
@@ -146,6 +212,24 @@ class MainWindow(QMainWindow):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
+
+        self.btn_save_profile = QPushButton("💾 保存为同步方案")
+        self.btn_save_profile.setMinimumHeight(38)
+        self.btn_save_profile.setStyleSheet("""
+            QPushButton {
+                background-color: #6f42c1;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 20px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover { background-color: #8b5cf6; }
+            QPushButton:disabled { background-color: #a0a0a0; }
+        """)
+        self.btn_save_profile.clicked.connect(self.save_current_as_profile)
+        btn_row.addWidget(self.btn_save_profile)
 
         self.btn_scan = QPushButton("开始对账扫描")
         self.btn_scan.setMinimumHeight(38)
@@ -185,7 +269,7 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_cancel_scan)
 
         path_layout.addLayout(btn_row)
-        main_layout.addWidget(path_group)
+        layout.addWidget(path_group)
 
         sync_group = QGroupBox("单向镜像同步（左 → 右）")
         sync_layout = QVBoxLayout(sync_group)
@@ -309,7 +393,7 @@ class MainWindow(QMainWindow):
         sync_btn_row.addWidget(self.btn_cancel_sync)
 
         sync_layout.addLayout(sync_btn_row)
-        main_layout.addWidget(sync_group)
+        layout.addWidget(sync_group)
 
         legend_group = QGroupBox("图例说明")
         legend_layout = QHBoxLayout(legend_group)
@@ -323,7 +407,7 @@ class MainWindow(QMainWindow):
         legend_layout.addWidget(self._legend_item(COLOR_SYNC_SYNCED, "已同步"))
         legend_layout.addWidget(self._legend_item(COLOR_SYNC_FAILED, "失败"))
         legend_layout.addStretch()
-        main_layout.addWidget(legend_group)
+        layout.addWidget(legend_group)
 
         table_group = QGroupBox("差异列表 / 同步清单")
         table_layout = QVBoxLayout(table_group)
@@ -353,17 +437,223 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         table_layout.addWidget(self.table)
 
-        main_layout.addWidget(table_group, stretch=1)
+        layout.addWidget(table_group, stretch=1)
+        return widget
 
-        self.statusbar = QStatusBar()
-        self.setStatusBar(self.statusbar)
-        self.status_label = QLabel("就绪")
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumWidth(200)
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setVisible(False)
-        self.statusbar.addWidget(self.status_label, stretch=1)
-        self.statusbar.addPermanentWidget(self.progress_bar)
+    def _build_multi_sync_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(10)
+        layout.setContentsMargins(6, 10, 6, 6)
+
+        top_splitter = QSplitter(Qt.Horizontal)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 6, 0)
+
+        profile_mgmt_group = QGroupBox("📁 同步方案管理")
+        pm_layout = QVBoxLayout(profile_mgmt_group)
+
+        pm_btn_row = QHBoxLayout()
+        self.btn_add_profile = QPushButton("➕ 新建")
+        self.btn_add_profile.setStyleSheet(self._btn_style("#28a745", "#218838"))
+        self.btn_add_profile.clicked.connect(self.add_profile_dialog)
+        pm_btn_row.addWidget(self.btn_add_profile)
+
+        self.btn_edit_profile = QPushButton("✏️ 编辑")
+        self.btn_edit_profile.setStyleSheet(self._btn_style("#17a2b8", "#138496"))
+        self.btn_edit_profile.clicked.connect(self.edit_selected_profile)
+        pm_btn_row.addWidget(self.btn_edit_profile)
+
+        self.btn_del_profile = QPushButton("🗑 删除")
+        self.btn_del_profile.setStyleSheet(self._btn_style("#dc3545", "#c82333"))
+        self.btn_del_profile.clicked.connect(self.delete_selected_profile)
+        pm_btn_row.addWidget(self.btn_del_profile)
+
+        pm_btn_row.addStretch()
+
+        self.btn_select_all = QPushButton("全选")
+        self.btn_select_all.setStyleSheet(self._btn_style("#6c757d", "#5a6268"))
+        self.btn_select_all.clicked.connect(lambda: self._set_all_profiles(True))
+        pm_btn_row.addWidget(self.btn_select_all)
+
+        self.btn_unselect_all = QPushButton("全不选")
+        self.btn_unselect_all.setStyleSheet(self._btn_style("#6c757d", "#5a6268"))
+        self.btn_unselect_all.clicked.connect(lambda: self._set_all_profiles(False))
+        pm_btn_row.addWidget(self.btn_unselect_all)
+
+        pm_layout.addLayout(pm_btn_row)
+
+        self.profile_table = QTableWidget(0, 5)
+        self.profile_table.setHorizontalHeaderLabels([
+            "", "方案名称", "源路径", "目标路径", "上次执行"
+        ])
+        self.profile_table.setColumnWidth(0, 40)
+        self.profile_table.setColumnWidth(1, 150)
+        self.profile_table.setColumnWidth(4, 140)
+        hdr = self.profile_table.horizontalHeader()
+        hdr.setSectionResizeMode(2, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.profile_table.verticalHeader().setVisible(False)
+        self.profile_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.profile_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.profile_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        pm_layout.addWidget(self.profile_table, stretch=1)
+
+        count_row = QHBoxLayout()
+        self.profile_count_label = QLabel("共 0 个方案")
+        self.profile_count_label.setStyleSheet("color: #666; font-weight: bold; font-size: 13px;")
+        count_row.addWidget(self.profile_count_label)
+        count_row.addStretch()
+        self.selected_count_label = QLabel("已选 0 个")
+        self.selected_count_label.setStyleSheet("color: #2c5aa0; font-weight: bold; font-size: 13px;")
+        count_row.addWidget(self.selected_count_label)
+        pm_layout.addLayout(count_row)
+
+        left_layout.addWidget(profile_mgmt_group, stretch=1)
+        top_splitter.addWidget(left_panel)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(6, 0, 0, 0)
+
+        exec_group = QGroupBox("🚀 批量执行与队列调度（最大并发 2 个）")
+        exec_layout = QVBoxLayout(exec_group)
+
+        exec_btn_row = QHBoxLayout()
+        self.btn_run_selected = QPushButton("▶ 执行选中方案")
+        self.btn_run_selected.setMinimumHeight(42)
+        self.btn_run_selected.setStyleSheet("""
+            QPushButton {
+                background: linear-gradient(135deg, #218838 0%, #28a745 100%);
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 10px 32px;
+                font-weight: bold;
+                font-size: 15px;
+            }
+            QPushButton:hover { background: linear-gradient(135deg, #2e9e47 0%, #34ce57 100%); }
+            QPushButton:disabled { background: #a0a0a0; }
+        """)
+        self.btn_run_selected.clicked.connect(self.run_selected_profiles)
+        exec_btn_row.addWidget(self.btn_run_selected, stretch=1)
+
+        self.btn_stop_scheduler = QPushButton("⏹ 停止全部")
+        self.btn_stop_scheduler.setMinimumHeight(42)
+        self.btn_stop_scheduler.setEnabled(False)
+        self.btn_stop_scheduler.setStyleSheet("""
+            QPushButton {
+                background: linear-gradient(135deg, #c82333 0%, #dc3545 100%);
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 10px 28px;
+                font-weight: bold;
+                font-size: 15px;
+            }
+            QPushButton:hover { background: linear-gradient(135deg, #e04454 0%, #f06570 100%); }
+            QPushButton:disabled { background: #a0a0a0; }
+        """)
+        self.btn_stop_scheduler.clicked.connect(self.stop_scheduler)
+        exec_btn_row.addWidget(self.btn_stop_scheduler)
+
+        exec_layout.addLayout(exec_btn_row)
+
+        sched_info_row = QHBoxLayout()
+        self.scheduler_status_label = QLabel("调度器：空闲")
+        self.scheduler_status_label.setStyleSheet("""
+            padding: 8px 16px;
+            border-radius: 6px;
+            background: #e8f5e9;
+            color: #2e7d32;
+            font-weight: bold;
+        """)
+        sched_info_row.addWidget(self.scheduler_status_label)
+        sched_info_row.addStretch()
+
+        self.scheduler_progress_bar = QProgressBar()
+        self.scheduler_progress_bar.setRange(0, 100)
+        self.scheduler_progress_bar.setValue(0)
+        self.scheduler_progress_bar.setFormat("%v/%m (%p%)")
+        self.scheduler_progress_bar.setMinimumHeight(26)
+        self.scheduler_progress_bar.setMinimumWidth(280)
+        sched_info_row.addWidget(QLabel("调度进度："))
+        sched_info_row.addWidget(self.scheduler_progress_bar)
+        exec_layout.addLayout(sched_info_row)
+
+        self.queue_table = QTableWidget(0, 7)
+        self.queue_table.setHorizontalHeaderLabels([
+            "", "方案名称", "源路径", "目标路径", "执行状态", "文件进度", "结果摘要"
+        ])
+        self.queue_table.setColumnWidth(0, 40)
+        self.queue_table.setColumnWidth(1, 130)
+        self.queue_table.setColumnWidth(4, 100)
+        self.queue_table.setColumnWidth(5, 180)
+        self.queue_table.setColumnWidth(6, 220)
+        qhdr = self.queue_table.horizontalHeader()
+        qhdr.setSectionResizeMode(2, QHeaderView.Stretch)
+        qhdr.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.queue_table.setSelectionBehavior(QTableWidget.SelectRows)
+        exec_layout.addWidget(self.queue_table, stretch=1)
+
+        report_btn_row = QHBoxLayout()
+        report_btn_row.addStretch()
+
+        self.btn_open_report = QPushButton("📊 打开 HTML 审计报告")
+        self.btn_open_report.setMinimumHeight(38)
+        self.btn_open_report.setEnabled(False)
+        self.btn_open_report.setStyleSheet("""
+            QPushButton {
+                background: linear-gradient(135deg, #6f42c1 0%, #8b5cf6 100%);
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 24px;
+                font-weight: bold;
+                font-size: 14px;
+            }
+            QPushButton:hover { background: linear-gradient(135deg, #8b5cf6 0%, #a78bfa 100%); }
+            QPushButton:disabled { background: #a0a0a0; }
+        """)
+        self.btn_open_report.clicked.connect(self.open_latest_report)
+        report_btn_row.addWidget(self.btn_open_report)
+
+        self.btn_save_report = QPushButton("💾 另存报告为...")
+        self.btn_save_report.setMinimumHeight(38)
+        self.btn_save_report.setEnabled(False)
+        self.btn_save_report.setStyleSheet(self._btn_style("#6c757d", "#5a6268"))
+        self.btn_save_report.clicked.connect(self.save_report_as)
+        report_btn_row.addWidget(self.btn_save_report)
+
+        exec_layout.addLayout(report_btn_row)
+
+        right_layout.addWidget(exec_group, stretch=1)
+        top_splitter.addWidget(right_panel)
+        top_splitter.setSizes([1, 1.3])
+
+        layout.addWidget(top_splitter, stretch=1)
+        self.last_report_path = None
+        return widget
+
+    def _btn_style(self, normal: str, hover: str) -> str:
+        return f"""
+            QPushButton {{
+                background-color: {normal};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 7px 18px;
+                font-weight: bold;
+                font-size: 13px;
+                min-height: 32px;
+            }}
+            QPushButton:hover {{ background-color: {hover}; }}
+            QPushButton:disabled {{ background-color: #a0a0a0; }}
+        """
 
     def _build_path_panel(self, label_text: str, side: str) -> QWidget:
         frame = QFrame()
@@ -421,6 +711,379 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "选择文件夹", start_dir)
         if path:
             edit.setText(path)
+
+    def save_current_as_profile(self):
+        source = self.left_edit.text().strip()
+        target = self.right_edit.text().strip()
+        if not source or not target:
+            QMessageBox.warning(self, "提示", "请先选择源路径和目标路径")
+            return
+        name, ok = QInputDialog.getText(
+            self, "保存为同步方案",
+            "请输入方案名称（如：备份照片、备份代码）："
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if self.profile_manager.find_by_name(name):
+            QMessageBox.warning(self, "提示", f"方案名称「{name}」已存在，请使用其他名称")
+            return
+        profile = SyncProfile(name=name, source_path=source, target_path=target)
+        if self.profile_manager.add_profile(profile):
+            QMessageBox.information(self, "成功", f"同步方案「{name}」已保存！")
+            self._refresh_profile_list()
+            self.tabs.setCurrentIndex(1)
+
+    def _refresh_profile_list(self):
+        profiles = self.profile_manager.get_all()
+        self.profile_table.setRowCount(0)
+        self.profile_rows.clear()
+
+        for row, p in enumerate(profiles):
+            self.profile_table.insertRow(row)
+
+            checkbox = QCheckBox()
+            checkbox_widget = QWidget()
+            cb_layout = QHBoxLayout(checkbox_widget)
+            cb_layout.addWidget(checkbox)
+            cb_layout.setAlignment(Qt.AlignCenter)
+            cb_layout.setContentsMargins(0, 0, 0, 0)
+            checkbox.stateChanged.connect(self._update_selected_count)
+            self.profile_table.setCellWidget(row, self.QUEUE_COL_CHECK, checkbox_widget)
+
+            self.profile_table.setItem(row, 1, QTableWidgetItem(p.name))
+            self.profile_table.setItem(row, 2, QTableWidgetItem(p.source_path))
+            self.profile_table.setItem(row, 3, QTableWidgetItem(p.target_path))
+            self.profile_table.setItem(row, 4, QTableWidgetItem(p.last_run_at or "—"))
+            self.profile_rows[p.profile_id] = row
+
+        self.profile_count_label.setText(f"共 {len(profiles)} 个方案")
+        self._update_selected_count()
+
+    def _update_selected_count(self):
+        count = 0
+        for row in range(self.profile_table.rowCount()):
+            widget = self.profile_table.cellWidget(row, self.QUEUE_COL_CHECK)
+            if widget:
+                cb = widget.findChild(QCheckBox)
+                if cb and cb.isChecked():
+                    count += 1
+        self.selected_count_label.setText(f"已选 {count} 个")
+
+    def _set_all_profiles(self, checked: bool):
+        for row in range(self.profile_table.rowCount()):
+            widget = self.profile_table.cellWidget(row, self.QUEUE_COL_CHECK)
+            if widget:
+                cb = widget.findChild(QCheckBox)
+                if cb:
+                    cb.blockSignals(True)
+                    cb.setChecked(checked)
+                    cb.blockSignals(False)
+        self._update_selected_count()
+
+    def add_profile_dialog(self):
+        name, ok = QInputDialog.getText(self, "新建同步方案", "方案名称：")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if self.profile_manager.find_by_name(name):
+            QMessageBox.warning(self, "提示", f"方案名称「{name}」已存在")
+            return
+        source = QFileDialog.getExistingDirectory(self, "选择源路径", str(Path.home()))
+        if not source:
+            return
+        target = QFileDialog.getExistingDirectory(self, "选择目标路径", str(Path.home()))
+        if not target:
+            return
+        profile = SyncProfile(name=name, source_path=source, target_path=target)
+        if self.profile_manager.add_profile(profile):
+            QMessageBox.information(self, "成功", f"方案「{name}」已创建！")
+            self._refresh_profile_list()
+
+    def edit_selected_profile(self):
+        row = self.profile_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "提示", "请先选择一个方案")
+            return
+        profile = self._get_profile_at_row(row)
+        if not profile:
+            return
+
+        name, ok = QInputDialog.getText(
+            self, "编辑方案", "修改方案名称：", text=profile.name
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        existing = self.profile_manager.find_by_name(name)
+        if existing and existing.profile_id != profile.profile_id:
+            QMessageBox.warning(self, "提示", f"名称「{name}」已被其他方案使用")
+            return
+
+        profile.name = name
+        self.profile_manager.update_profile(profile)
+        self._refresh_profile_list()
+        QMessageBox.information(self, "成功", "方案信息已更新")
+
+    def delete_selected_profile(self):
+        row = self.profile_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "提示", "请先选择一个方案")
+            return
+        profile = self._get_profile_at_row(row)
+        if not profile:
+            return
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除方案「{profile.name}」吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.profile_manager.delete_profile(profile.profile_id)
+            self._refresh_profile_list()
+
+    def _get_profile_at_row(self, row: int):
+        profiles = self.profile_manager.get_all()
+        return profiles[row] if 0 <= row < len(profiles) else None
+
+    def _get_checked_profiles(self):
+        all_profiles = self.profile_manager.get_all()
+        checked = []
+        for row in range(self.profile_table.rowCount()):
+            widget = self.profile_table.cellWidget(row, self.QUEUE_COL_CHECK)
+            if widget:
+                cb = widget.findChild(QCheckBox)
+                if cb and cb.isChecked():
+                    if row < len(all_profiles):
+                        checked.append(all_profiles[row])
+        return checked
+
+    def run_selected_profiles(self):
+        profiles = self._get_checked_profiles()
+        if not profiles:
+            QMessageBox.warning(self, "提示", "请先勾选至少一个同步方案")
+            return
+
+        for p in profiles:
+            if not Path(p.source_path).is_dir():
+                QMessageBox.warning(self, "路径无效",
+                    f"方案「{p.name}」的源路径不存在：\n{p.source_path}")
+                return
+            if not Path(p.target_path).is_dir():
+                QMessageBox.warning(self, "路径无效",
+                    f"方案「{p.name}」的目标路径不存在：\n{p.target_path}")
+                return
+
+        reply = QMessageBox.question(
+            self, "确认批量执行",
+            f"即将执行 {len(profiles)} 个同步方案（最大并发 2 个）：\n\n" +
+            "\n".join(f"  • {p.name}" for p in profiles) +
+            "\n\n完成后将自动生成 HTML 对账审计报告。\n是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.queue_results = []
+        self._init_queue_table(profiles)
+        self.btn_run_selected.setEnabled(False)
+        self.btn_stop_scheduler.setEnabled(True)
+        self.btn_open_report.setEnabled(False)
+        self.btn_save_report.setEnabled(False)
+        self._set_scheduler_state("运行中", "running")
+
+        self.task_scheduler = TaskScheduler(profiles)
+        self.task_scheduler.scheduler_started.connect(self._on_scheduler_started)
+        self.task_scheduler.scheduler_progress.connect(self._on_scheduler_progress)
+        self.task_scheduler.profile_running.connect(self._on_profile_running)
+        self.task_scheduler.profile_completed.connect(self._on_profile_completed)
+        self.task_scheduler.all_completed.connect(self._on_all_completed)
+        self.task_scheduler.status_message.connect(self._on_scheduler_msg)
+        self.task_scheduler.start()
+
+    def _init_queue_table(self, profiles):
+        self.queue_table.setRowCount(0)
+        self.profile_rows.clear()
+
+        for row, p in enumerate(profiles):
+            self.queue_table.insertRow(row)
+            self.profile_rows[p.profile_id] = row
+
+            self.queue_table.setItem(row, self.QUEUE_COL_NAME, QTableWidgetItem(p.name))
+            self.queue_table.setItem(row, self.QUEUE_COL_SOURCE, QTableWidgetItem(p.source_path))
+            self.queue_table.setItem(row, self.QUEUE_COL_TARGET, QTableWidgetItem(p.target_path))
+
+            status_item = QTableWidgetItem("⏳ 等待中")
+            status_item.setBackground(QBrush(COLOR_QUEUE_WAITING))
+            status_item.setTextAlignment(Qt.AlignCenter)
+            self.queue_table.setItem(row, self.QUEUE_COL_STATUS, status_item)
+
+            file_bar = QProgressBar()
+            file_bar.setRange(0, 100)
+            file_bar.setValue(0)
+            file_bar.setFormat("%p%")
+            file_bar.setMaximumHeight(20)
+            self.queue_table.setCellWidget(row, self.QUEUE_COL_PROGRESS, file_bar)
+
+            self.queue_table.setItem(row, self.QUEUE_COL_SUMMARY, QTableWidgetItem(""))
+
+    def stop_scheduler(self):
+        if self.task_scheduler and self.task_scheduler.isRunning():
+            reply = QMessageBox.question(
+                self, "确认停止",
+                "确定要停止所有正在执行的同步任务吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.task_scheduler.cancel_all()
+                self.status_label.setText("正在停止调度器...")
+
+    def _set_scheduler_state(self, text: str, state: str):
+        self.scheduler_status_label.setText(f"调度器：{text}")
+        if state == "running":
+            style = """
+                padding: 8px 16px; border-radius: 6px;
+                background: #fff3cd; color: #856404; font-weight: bold;
+                border: 1px solid #ffc107;
+            """
+        elif state == "done":
+            style = """
+                padding: 8px 16px; border-radius: 6px;
+                background: #d4edda; color: #155724; font-weight: bold;
+                border: 1px solid #28a745;
+            """
+        elif state == "error":
+            style = """
+                padding: 8px 16px; border-radius: 6px;
+                background: #f8d7da; color: #721c24; font-weight: bold;
+                border: 1px solid #dc3545;
+            """
+        else:
+            style = """
+                padding: 8px 16px; border-radius: 6px;
+                background: #e8f5e9; color: #2e7d32; font-weight: bold;
+            """
+        self.scheduler_status_label.setStyleSheet(style)
+
+    def _on_scheduler_started(self, total: int):
+        self.scheduler_progress_bar.setRange(0, total)
+        self.scheduler_progress_bar.setValue(0)
+
+    def _on_scheduler_progress(self, done: int, total: int):
+        self.scheduler_progress_bar.setRange(0, total)
+        self.scheduler_progress_bar.setValue(done)
+
+    def _on_scheduler_msg(self, msg: str):
+        self.status_label.setText(msg)
+
+    def _on_profile_running(self, profile):
+        row = self.profile_rows.get(profile.profile_id)
+        if row is not None:
+            status_item = self.queue_table.item(row, self.QUEUE_COL_STATUS)
+            if status_item:
+                status_item.setText("🔄 执行中")
+                status_item.setBackground(QBrush(COLOR_QUEUE_RUNNING))
+
+    def _on_profile_completed(self, result: ProfileResult):
+        row = self.profile_rows.get(result.profile_id)
+        if row is not None:
+            if result.failed_count > 0:
+                status_text = f"❌ 失败{result.failed_count}"
+                color = COLOR_QUEUE_ERROR
+            elif result.skipped_count > 0:
+                status_text = f"⚠️ 跳过{result.skipped_count}"
+                color = QColor(255, 200, 100)
+            elif result.total_files == 0:
+                status_text = "✅ 无差异"
+                color = COLOR_QUEUE_DONE
+            else:
+                status_text = "✅ 成功"
+                color = COLOR_QUEUE_DONE
+
+            status_item = self.queue_table.item(row, self.QUEUE_COL_STATUS)
+            if status_item:
+                status_item.setText(status_text)
+                status_item.setBackground(QBrush(color))
+
+            bar = self.queue_table.cellWidget(row, self.QUEUE_COL_PROGRESS)
+            if bar and isinstance(bar, QProgressBar):
+                if result.total_files > 0:
+                    bar.setRange(0, result.total_files)
+                    bar.setValue(result.success_count)
+                    bar.setFormat(
+                        f"{result.success_count}/{result.total_files}"
+                        f" ({int(result.success_count/result.total_files*100)}%)"
+                    )
+                else:
+                    bar.setRange(0, 1)
+                    bar.setValue(1)
+                    bar.setFormat("—")
+
+            summary = (
+                f"总{result.total_files} 成功{result.success_count} "
+                f"失败{result.failed_count} 跳过{result.skipped_count}"
+            )
+            self.queue_table.setItem(row, self.QUEUE_COL_SUMMARY, QTableWidgetItem(summary))
+
+        self.profile_manager.update_last_run(result.profile_id)
+
+    def _on_all_completed(self, results: list):
+        self.queue_results = results
+        self.btn_run_selected.setEnabled(True)
+        self.btn_stop_scheduler.setEnabled(False)
+
+        total_failed = sum(r.failed_count for r in results)
+        total_skipped = sum(r.skipped_count for r in results)
+        if total_failed > 0:
+            self._set_scheduler_state("完成（含失败）", "error")
+        elif total_skipped > 0:
+            self._set_scheduler_state("完成（含跳过）", "done")
+        else:
+            self._set_scheduler_state("全部完成", "done")
+
+        self._refresh_profile_list()
+
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_dir = Path.home() / "SyncMasterReports"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            report_path = report_dir / f"sync_report_{ts}.html"
+            generate_report(results, str(report_path))
+            self.last_report_path = str(report_path)
+            self.btn_open_report.setEnabled(True)
+            self.btn_save_report.setEnabled(True)
+
+            total_success = sum(r.success_count for r in results)
+            QMessageBox.information(
+                self, "批量同步完成",
+                f"已完成 {len(results)} 个方案的同步。\n\n"
+                f"✅ 成功：{total_success} 个文件\n"
+                f"❌ 失败：{total_failed} 个文件\n"
+                f"⏭ 跳过：{total_skipped} 个文件\n\n"
+                f"📊 HTML 审计报告已生成：\n{report_path}"
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "报告生成失败",
+                f"同步已完成，但报告生成出错：{e}")
+
+    def open_latest_report(self):
+        if self.last_report_path and Path(self.last_report_path).exists():
+            webbrowser.open(f"file:///{self.last_report_path}")
+
+    def save_report_as(self):
+        if not self.queue_results:
+            return
+        default_name = f"sync_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存审计报告", default_name, "HTML 文件 (*.html)"
+        )
+        if path:
+            generate_report(self.queue_results, path)
+            QMessageBox.information(self, "成功", f"报告已保存到：\n{path}")
 
     def start_scan(self):
         left_path = self.left_edit.text().strip()
