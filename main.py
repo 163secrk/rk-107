@@ -13,12 +13,19 @@ from PyQt5.QtWidgets import (
 
 from scanner import DiffItem, FileInfo
 from scan_thread import ScanThread
+from sync_thread import SyncThread, SyncTask
 
 
 COLOR_LEFT_ONLY = QColor(255, 200, 200)
 COLOR_RIGHT_ONLY = QColor(200, 200, 255)
 COLOR_DIFF = QColor(255, 245, 180)
 COLOR_IDENTICAL = QColor(220, 255, 220)
+
+COLOR_SYNC_PENDING = QColor(240, 240, 240)
+COLOR_SYNC_COPYING = QColor(255, 235, 150)
+COLOR_SYNC_SYNCED = QColor(180, 240, 180)
+COLOR_SYNC_FAILED = QColor(255, 160, 160)
+COLOR_SYNC_SKIPPED = QColor(220, 220, 220)
 
 
 def format_size(size: int) -> str:
@@ -59,13 +66,48 @@ def get_color_for_status(status: str) -> QColor:
         return COLOR_IDENTICAL
 
 
+def get_sync_status_text(status: str) -> str:
+    mapping = {
+        SyncTask.STATUS_PENDING: "待同步",
+        SyncTask.STATUS_COPYING: "正在复制",
+        SyncTask.STATUS_SYNCED: "已同步",
+        SyncTask.STATUS_FAILED: "失败",
+        SyncTask.STATUS_SKIPPED: "已跳过",
+    }
+    return mapping.get(status, status)
+
+
+def get_color_for_sync_status(status: str) -> QColor:
+    mapping = {
+        SyncTask.STATUS_PENDING: COLOR_SYNC_PENDING,
+        SyncTask.STATUS_COPYING: COLOR_SYNC_COPYING,
+        SyncTask.STATUS_SYNCED: COLOR_SYNC_SYNCED,
+        SyncTask.STATUS_FAILED: COLOR_SYNC_FAILED,
+        SyncTask.STATUS_SKIPPED: COLOR_SYNC_SKIPPED,
+    }
+    return mapping.get(status, COLOR_SYNC_PENDING)
+
+
 class MainWindow(QMainWindow):
+    COL_STATUS = 0
+    COL_REL_PATH = 1
+    COL_LEFT_SIZE = 2
+    COL_RIGHT_SIZE = 3
+    COL_LEFT_TIME = 4
+    COL_RIGHT_TIME = 5
+    COL_FULL_PATH = 6
+    COL_SYNC_STATUS = 7
+    COL_SYNC_PROGRESS = 8
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("同步大师 (SyncMaster) - 专业文件夹对账与同步工具")
-        self.setMinimumSize(1200, 700)
+        self.setMinimumSize(1300, 800)
         self.scan_thread: ScanThread = None
+        self.sync_thread: SyncThread = None
         self.current_diffs: list = []
+        self.sync_tasks: list = []
+        self.diff_row_to_task: dict = {}
         self._init_ui()
 
     def _init_ui(self):
@@ -119,10 +161,10 @@ class MainWindow(QMainWindow):
         self.btn_scan.clicked.connect(self.start_scan)
         btn_row.addWidget(self.btn_scan)
 
-        self.btn_cancel = QPushButton("取消扫描")
-        self.btn_cancel.setMinimumHeight(38)
-        self.btn_cancel.setEnabled(False)
-        self.btn_cancel.setStyleSheet("""
+        self.btn_cancel_scan = QPushButton("取消扫描")
+        self.btn_cancel_scan.setMinimumHeight(38)
+        self.btn_cancel_scan.setEnabled(False)
+        self.btn_cancel_scan.setStyleSheet("""
             QPushButton {
                 background-color: #a94442;
                 color: white;
@@ -135,11 +177,82 @@ class MainWindow(QMainWindow):
             QPushButton:hover { background-color: #c25d5a; }
             QPushButton:disabled { background-color: #a0a0a0; }
         """)
-        self.btn_cancel.clicked.connect(self.cancel_scan)
-        btn_row.addWidget(self.btn_cancel)
+        self.btn_cancel_scan.clicked.connect(self.cancel_scan)
+        btn_row.addWidget(self.btn_cancel_scan)
 
         path_layout.addLayout(btn_row)
         main_layout.addWidget(path_group)
+
+        sync_group = QGroupBox("单向镜像同步（左 → 右）")
+        sync_layout = QVBoxLayout(sync_group)
+
+        sync_info_row = QHBoxLayout()
+        self.sync_info_label = QLabel("请先完成对账扫描，然后点击「开始同步」执行单向镜像（左→右）。")
+        self.sync_info_label.setStyleSheet("color: #555;")
+        sync_info_row.addWidget(self.sync_info_label)
+        sync_info_row.addStretch()
+        sync_layout.addLayout(sync_info_row)
+
+        overall_row = QHBoxLayout()
+        overall_label = QLabel("总进度：")
+        overall_label.setStyleSheet("font-weight: bold;")
+        self.overall_progress_bar = QProgressBar()
+        self.overall_progress_bar.setRange(0, 100)
+        self.overall_progress_bar.setValue(0)
+        self.overall_progress_bar.setFormat("%v/%m (%p%)")
+        self.overall_progress_bar.setMinimumHeight(26)
+
+        self.overall_count_label = QLabel("待同步：0 个")
+        self.overall_count_label.setStyleSheet("color: #555; margin-left: 12px;")
+
+        overall_row.addWidget(overall_label)
+        overall_row.addWidget(self.overall_progress_bar, stretch=1)
+        overall_row.addWidget(self.overall_count_label)
+        sync_layout.addLayout(overall_row)
+
+        sync_btn_row = QHBoxLayout()
+        sync_btn_row.addStretch()
+
+        self.btn_start_sync = QPushButton("▶ 开始同步")
+        self.btn_start_sync.setMinimumHeight(38)
+        self.btn_start_sync.setEnabled(False)
+        self.btn_start_sync.setStyleSheet("""
+            QPushButton {
+                background-color: #218838;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 28px;
+                font-weight: bold;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #2e9e47; }
+            QPushButton:disabled { background-color: #a0a0a0; }
+        """)
+        self.btn_start_sync.clicked.connect(self.start_sync)
+        sync_btn_row.addWidget(self.btn_start_sync)
+
+        self.btn_cancel_sync = QPushButton("⏹ 取消同步")
+        self.btn_cancel_sync.setMinimumHeight(38)
+        self.btn_cancel_sync.setEnabled(False)
+        self.btn_cancel_sync.setStyleSheet("""
+            QPushButton {
+                background-color: #a94442;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 28px;
+                font-weight: bold;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #c25d5a; }
+            QPushButton:disabled { background-color: #a0a0a0; }
+        """)
+        self.btn_cancel_sync.clicked.connect(self.cancel_sync)
+        sync_btn_row.addWidget(self.btn_cancel_sync)
+
+        sync_layout.addLayout(sync_btn_row)
+        main_layout.addWidget(sync_group)
 
         legend_group = QGroupBox("图例说明")
         legend_layout = QHBoxLayout(legend_group)
@@ -147,26 +260,36 @@ class MainWindow(QMainWindow):
         legend_layout.addWidget(self._legend_item(COLOR_RIGHT_ONLY, "右侧独有"))
         legend_layout.addWidget(self._legend_item(COLOR_DIFF, "大小/时间不同"))
         legend_layout.addWidget(self._legend_item(COLOR_IDENTICAL, "完全相同"))
+        legend_layout.addSpacing(20)
+        legend_layout.addWidget(self._legend_item(COLOR_SYNC_PENDING, "待同步"))
+        legend_layout.addWidget(self._legend_item(COLOR_SYNC_COPYING, "正在复制"))
+        legend_layout.addWidget(self._legend_item(COLOR_SYNC_SYNCED, "已同步"))
+        legend_layout.addWidget(self._legend_item(COLOR_SYNC_FAILED, "失败"))
         legend_layout.addStretch()
         main_layout.addWidget(legend_group)
 
-        table_group = QGroupBox("差异列表")
+        table_group = QGroupBox("差异列表 / 同步清单")
         table_layout = QVBoxLayout(table_group)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels([
-            "状态", "相对路径", "左侧大小", "右侧大小",
-            "左侧修改时间", "右侧修改时间", "完整路径"
+            "差异状态", "相对路径", "左侧大小", "右侧大小",
+            "左侧修改时间", "右侧修改时间", "完整路径",
+            "同步状态", "文件进度"
         ])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setStretchLastSection(True)
+        header.setStretchLastSection(False)
         self.table.setColumnWidth(0, 110)
-        self.table.setColumnWidth(1, 300)
-        self.table.setColumnWidth(2, 100)
-        self.table.setColumnWidth(3, 100)
-        self.table.setColumnWidth(4, 150)
-        self.table.setColumnWidth(5, 150)
+        self.table.setColumnWidth(1, 280)
+        self.table.setColumnWidth(2, 95)
+        self.table.setColumnWidth(3, 95)
+        self.table.setColumnWidth(4, 145)
+        self.table.setColumnWidth(5, 145)
+        self.table.setColumnWidth(6, 200)
+        self.table.setColumnWidth(7, 90)
+        self.table.setColumnWidth(8, 180)
+        header.setSectionResizeMode(6, QHeaderView.Stretch)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setAlternatingRowColors(False)
@@ -254,11 +377,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "源路径和目标路径不能相同")
             return
 
+        self._reset_sync_ui()
         self.table.setRowCount(0)
         self.current_diffs = []
         self.progress_bar.setVisible(True)
         self.btn_scan.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
+        self.btn_cancel_scan.setEnabled(True)
+        self.btn_start_sync.setEnabled(False)
 
         self.scan_thread = ScanThread(left_path, right_path)
         self.scan_thread.progress.connect(self.on_scan_progress)
@@ -280,51 +405,74 @@ class MainWindow(QMainWindow):
     def on_scan_complete(self, diffs: list):
         self.progress_bar.setVisible(False)
         self.btn_scan.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
+        self.btn_cancel_scan.setEnabled(False)
         self.current_diffs = diffs
         self._populate_table(diffs)
 
         if diffs:
             identical = sum(1 for d in diffs if d.status == DiffItem.STATUS_IDENTICAL)
             different = len(diffs) - identical
+            pending_sync = sum(1 for d in diffs if d.status in (
+                DiffItem.STATUS_LEFT_ONLY,
+                DiffItem.STATUS_DIFF_SIZE,
+                DiffItem.STATUS_DIFF_TIME,
+                DiffItem.STATUS_DIFF_BOTH
+            ))
             self.status_label.setText(
                 f"扫描完成：共 {len(diffs)} 项，相同 {identical} 项，差异 {different} 项"
             )
+            self.sync_info_label.setText(
+                f"扫描完成：共 {len(diffs)} 项，待同步 {pending_sync} 项（左→右）。"
+            )
+            self.overall_count_label.setText(f"待同步：{pending_sync} 个")
+            if pending_sync > 0:
+                self.btn_start_sync.setEnabled(True)
+
+    def _reset_sync_ui(self):
+        self.sync_tasks = []
+        self.diff_row_to_task = {}
+        self.overall_progress_bar.setRange(0, 100)
+        self.overall_progress_bar.setValue(0)
+        self.overall_progress_bar.setFormat("%v/%m (%p%)")
+        self.overall_count_label.setText("待同步：0 个")
+        self.sync_info_label.setText("请先完成对账扫描，然后点击「开始同步」执行单向镜像（左→右）。")
 
     def _populate_table(self, diffs: list):
         self.table.setRowCount(0)
         self.table.setRowCount(len(diffs))
+        self.diff_row_to_task = {}
+        task_idx = 0
 
         for row, diff in enumerate(diffs):
             bg_color = get_color_for_status(diff.status)
 
             status_item = QTableWidgetItem(get_status_text(diff.status))
             status_item.setBackground(QBrush(bg_color))
-            self.table.setItem(row, 0, status_item)
+            self.table.setItem(row, self.COL_STATUS, status_item)
 
             path_item = QTableWidgetItem(diff.rel_path)
             path_item.setBackground(QBrush(bg_color))
-            self.table.setItem(row, 1, path_item)
+            self.table.setItem(row, self.COL_REL_PATH, path_item)
 
             left_size = format_size(diff.left_file.size) if diff.left_file else "-"
             left_size_item = QTableWidgetItem(left_size)
             left_size_item.setBackground(QBrush(bg_color))
-            self.table.setItem(row, 2, left_size_item)
+            self.table.setItem(row, self.COL_LEFT_SIZE, left_size_item)
 
             right_size = format_size(diff.right_file.size) if diff.right_file else "-"
             right_size_item = QTableWidgetItem(right_size)
             right_size_item.setBackground(QBrush(bg_color))
-            self.table.setItem(row, 3, right_size_item)
+            self.table.setItem(row, self.COL_RIGHT_SIZE, right_size_item)
 
             left_time = format_time(diff.left_file.mtime) if diff.left_file else "-"
             left_time_item = QTableWidgetItem(left_time)
             left_time_item.setBackground(QBrush(bg_color))
-            self.table.setItem(row, 4, left_time_item)
+            self.table.setItem(row, self.COL_LEFT_TIME, left_time_item)
 
             right_time = format_time(diff.right_file.mtime) if diff.right_file else "-"
             right_time_item = QTableWidgetItem(right_time)
             right_time_item.setBackground(QBrush(bg_color))
-            self.table.setItem(row, 5, right_time_item)
+            self.table.setItem(row, self.COL_RIGHT_TIME, right_time_item)
 
             if diff.left_file:
                 full_path = str(diff.left_file.path)
@@ -334,7 +482,202 @@ class MainWindow(QMainWindow):
                 full_path = ""
             full_item = QTableWidgetItem(full_path)
             full_item.setBackground(QBrush(bg_color))
-            self.table.setItem(row, 6, full_item)
+            self.table.setItem(row, self.COL_FULL_PATH, full_item)
+
+            needs_sync = diff.status in (
+                DiffItem.STATUS_LEFT_ONLY,
+                DiffItem.STATUS_DIFF_SIZE,
+                DiffItem.STATUS_DIFF_TIME,
+                DiffItem.STATUS_DIFF_BOTH
+            )
+            if needs_sync:
+                sync_bg = COLOR_SYNC_PENDING
+                sync_status_text = get_sync_status_text(SyncTask.STATUS_PENDING)
+                self.diff_row_to_task[row] = task_idx
+                task_idx += 1
+            else:
+                sync_bg = QColor(255, 255, 255)
+                sync_status_text = "—"
+
+            sync_status_item = QTableWidgetItem(sync_status_text)
+            sync_status_item.setBackground(QBrush(sync_bg))
+            sync_status_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, self.COL_SYNC_STATUS, sync_status_item)
+
+            if needs_sync:
+                file_bar = QProgressBar()
+                file_bar.setRange(0, 100)
+                file_bar.setValue(0)
+                file_bar.setTextVisible(True)
+                file_bar.setFormat("%p%")
+                file_bar.setMaximumHeight(20)
+                self.table.setCellWidget(row, self.COL_SYNC_PROGRESS, file_bar)
+            else:
+                no_bar = QLabel("—")
+                no_bar.setAlignment(Qt.AlignCenter)
+                no_bar.setStyleSheet("color: #999;")
+                self.table.setCellWidget(row, self.COL_SYNC_PROGRESS, no_bar)
+
+    def start_sync(self):
+        left_path = self.left_edit.text().strip()
+        right_path = self.right_edit.text().strip()
+
+        if not self.current_diffs:
+            QMessageBox.warning(self, "提示", "没有扫描结果，请先执行对账扫描")
+            return
+
+        pending_count = sum(1 for d in self.current_diffs if d.status in (
+            DiffItem.STATUS_LEFT_ONLY,
+            DiffItem.STATUS_DIFF_SIZE,
+            DiffItem.STATUS_DIFF_TIME,
+            DiffItem.STATUS_DIFF_BOTH
+        ))
+        if pending_count == 0:
+            QMessageBox.information(self, "提示", "没有需要同步的文件")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认同步",
+            f"即将执行单向镜像同步（左 → 右）。\n\n"
+            f"源路径：{left_path}\n"
+            f"目标路径：{right_path}\n\n"
+            f"待同步文件数：{pending_count}\n\n"
+            f"注意：目标路径下的同名文件将被覆盖，且不会删除右侧独有文件。\n\n"
+            f"是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.btn_start_sync.setEnabled(False)
+        self.btn_cancel_sync.setEnabled(True)
+        self.btn_scan.setEnabled(False)
+
+        self.sync_thread = SyncThread(left_path, right_path, self.current_diffs)
+        self.sync_thread.task_list_ready.connect(self.on_sync_task_list_ready)
+        self.sync_thread.file_started.connect(self.on_sync_file_started)
+        self.sync_thread.file_progress.connect(self.on_sync_file_progress)
+        self.sync_thread.file_finished.connect(self.on_sync_file_finished)
+        self.sync_thread.overall_progress.connect(self.on_sync_overall_progress)
+        self.sync_thread.sync_complete.connect(self.on_sync_complete)
+        self.sync_thread.status_changed.connect(self.on_status_changed)
+        self.sync_thread.start()
+
+    def cancel_sync(self):
+        if self.sync_thread and self.sync_thread.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "确认取消",
+                "确定要取消同步吗？已开始复制的文件将被中断。",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.sync_thread.cancel()
+                self.status_label.setText("正在取消同步 ...")
+
+    def on_sync_task_list_ready(self, tasks: list):
+        self.sync_tasks = tasks
+        total = len(tasks)
+        self.overall_progress_bar.setRange(0, total if total > 0 else 100)
+        self.overall_progress_bar.setValue(0)
+        self.overall_count_label.setText(f"待同步：{total} 个")
+
+        task_to_diff_row = {v: k for k, v in self.diff_row_to_task.items()}
+
+        for task in tasks:
+            row = task_to_diff_row.get(task.index)
+            if row is not None:
+                sync_status_item = self.table.item(row, self.COL_SYNC_STATUS)
+                if sync_status_item:
+                    sync_status_item.setText(get_sync_status_text(SyncTask.STATUS_PENDING))
+                    sync_status_item.setBackground(QBrush(COLOR_SYNC_PENDING))
+
+    def on_sync_file_started(self, task_index: int):
+        task_to_diff_row = {v: k for k, v in self.diff_row_to_task.items()}
+        row = task_to_diff_row.get(task_index)
+        if row is not None:
+            sync_status_item = self.table.item(row, self.COL_SYNC_STATUS)
+            if sync_status_item:
+                sync_status_item.setText(get_sync_status_text(SyncTask.STATUS_COPYING))
+                sync_status_item.setBackground(QBrush(COLOR_SYNC_COPYING))
+                sync_status_item.setToolTip("正在复制文件 ...")
+
+    def on_sync_file_progress(self, task_index: int, copied_bytes: int):
+        task_to_diff_row = {v: k for k, v in self.diff_row_to_task.items()}
+        row = task_to_diff_row.get(task_index)
+        if row is not None:
+            task = self.sync_tasks[task_index] if task_index < len(self.sync_tasks) else None
+            file_bar = self.table.cellWidget(row, self.COL_SYNC_PROGRESS)
+            if file_bar and isinstance(file_bar, QProgressBar) and task:
+                total = task.size
+                if total > 0:
+                    pct = int(copied_bytes / total * 100)
+                else:
+                    pct = 100
+                file_bar.setRange(0, total)
+                file_bar.setValue(copied_bytes)
+                file_bar.setFormat(
+                    f"{format_size(copied_bytes)}/{format_size(total)} ({pct}%)"
+                )
+
+    def on_sync_file_finished(self, task_index: int, status: str, error_msg: str):
+        task_to_diff_row = {v: k for k, v in self.diff_row_to_task.items()}
+        row = task_to_diff_row.get(task_index)
+        if row is not None:
+            sync_status_item = self.table.item(row, self.COL_SYNC_STATUS)
+            if sync_status_item:
+                sync_status_item.setText(get_sync_status_text(status))
+                sync_status_item.setBackground(QBrush(get_color_for_sync_status(status)))
+                if error_msg:
+                    sync_status_item.setToolTip(error_msg)
+                else:
+                    sync_status_item.setToolTip("")
+
+            task = self.sync_tasks[task_index] if task_index < len(self.sync_tasks) else None
+            file_bar = self.table.cellWidget(row, self.COL_SYNC_PROGRESS)
+            if file_bar and isinstance(file_bar, QProgressBar) and task:
+                if status == SyncTask.STATUS_SYNCED:
+                    file_bar.setValue(task.size)
+                    file_bar.setFormat(f"✓ {format_size(task.size)} (100%)")
+                elif status == SyncTask.STATUS_FAILED:
+                    file_bar.setFormat(f"✗ 失败: {error_msg[:30]}")
+                elif status == SyncTask.STATUS_SKIPPED:
+                    file_bar.setFormat("已取消")
+
+    def on_sync_overall_progress(self, current: int, total: int):
+        self.overall_progress_bar.setRange(0, total if total > 0 else 100)
+        self.overall_progress_bar.setValue(current)
+        remaining = total - current
+        self.overall_count_label.setText(
+            f"进度：{current}/{total}，剩余：{remaining} 个"
+        )
+
+    def on_sync_complete(self, synced: int, failed: int, skipped: int):
+        self.btn_start_sync.setEnabled(True)
+        self.btn_cancel_sync.setEnabled(False)
+        self.btn_scan.setEnabled(True)
+
+        total = synced + failed + skipped
+        msg = (
+            f"同步任务结束。\n\n"
+            f"总计：{total} 个\n"
+            f"成功：{synced} 个\n"
+            f"失败：{failed} 个\n"
+            f"跳过/取消：{skipped} 个"
+        )
+        if failed > 0:
+            QMessageBox.warning(self, "同步完成（有失败）", msg)
+        elif skipped > 0:
+            QMessageBox.information(self, "同步已取消", msg)
+        else:
+            QMessageBox.information(self, "同步完成", msg)
+
+        self.overall_count_label.setText(
+            f"完成：成功 {synced} / 失败 {failed} / 跳过 {skipped}"
+        )
 
 
 def main():
