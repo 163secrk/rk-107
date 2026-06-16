@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
 from scanner import DiffItem, FileInfo
 from scan_thread import ScanThread
 from sync_thread import SyncThread, SyncTask
+from watch_thread import WatchThread
 
 
 COLOR_LEFT_ONLY = QColor(255, 200, 200)
@@ -105,9 +106,12 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1300, 800)
         self.scan_thread: ScanThread = None
         self.sync_thread: SyncThread = None
+        self.watch_thread: WatchThread = None
         self.current_diffs: list = []
         self.sync_tasks: list = []
         self.diff_row_to_task: dict = {}
+        self._pending_auto_sync_paths: list = None
+        self._auto_sync_active: bool = False
         self._init_ui()
 
     def _init_ui(self):
@@ -209,6 +213,59 @@ class MainWindow(QMainWindow):
         overall_row.addWidget(self.overall_progress_bar, stretch=1)
         overall_row.addWidget(self.overall_count_label)
         sync_layout.addLayout(overall_row)
+
+        watch_row = QHBoxLayout()
+
+        self.watch_status_label = QLabel("自动同步：未开启")
+        self.watch_status_label.setStyleSheet("""
+            padding: 6px 14px;
+            border-radius: 4px;
+            background-color: #e0e0e0;
+            color: #555;
+            font-weight: bold;
+        """)
+        watch_row.addWidget(self.watch_status_label)
+
+        watch_row.addStretch()
+
+        self.btn_start_watch = QPushButton("👁 开启自动同步监控")
+        self.btn_start_watch.setMinimumHeight(36)
+        self.btn_start_watch.setStyleSheet("""
+            QPushButton {
+                background-color: #138496;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 7px 22px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover { background-color: #17a2b8; }
+            QPushButton:disabled { background-color: #a0a0a0; }
+        """)
+        self.btn_start_watch.clicked.connect(self.start_watch)
+        watch_row.addWidget(self.btn_start_watch)
+
+        self.btn_stop_watch = QPushButton("⏸ 停止自动同步监控")
+        self.btn_stop_watch.setMinimumHeight(36)
+        self.btn_stop_watch.setEnabled(False)
+        self.btn_stop_watch.setStyleSheet("""
+            QPushButton {
+                background-color: #6c757d;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 7px 22px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover { background-color: #868e96; }
+            QPushButton:disabled { background-color: #a0a0a0; }
+        """)
+        self.btn_stop_watch.clicked.connect(self.stop_watch)
+        watch_row.addWidget(self.btn_stop_watch)
+
+        sync_layout.addLayout(watch_row)
 
         sync_btn_row = QHBoxLayout()
         sync_btn_row.addStretch()
@@ -333,10 +390,18 @@ class MainWindow(QMainWindow):
             self.right_btn = btn
             btn.clicked.connect(lambda: self._browse(self.right_edit))
 
+        edit.textChanged.connect(self._on_path_changed)
+
         row.addWidget(edit, stretch=1)
         row.addWidget(btn)
         layout.addLayout(row)
         return frame
+
+    def _on_path_changed(self):
+        if self.watch_thread and self.watch_thread.isRunning():
+            self._auto_sync_active = False
+            self.watch_thread.stop()
+            self.status_label.setText("路径已变更，自动同步监控已停止")
 
     def _legend_item(self, color: QColor, text: str) -> QWidget:
         box = QHBoxLayout()
@@ -376,6 +441,21 @@ class MainWindow(QMainWindow):
         if left_path == right_path:
             QMessageBox.warning(self, "提示", "源路径和目标路径不能相同")
             return
+
+        if self.watch_thread and self.watch_thread.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "停止自动监控",
+                "执行手动对账扫描需要先停止自动同步监控。是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+            self._auto_sync_active = False
+            self.watch_thread.stop()
+            self.btn_start_watch.setEnabled(False)
+            self.btn_stop_watch.setEnabled(False)
 
         self._reset_sync_ui()
         self.table.setRowCount(0)
@@ -577,6 +657,240 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.Yes:
                 self.sync_thread.cancel()
                 self.status_label.setText("正在取消同步 ...")
+
+    def start_watch(self):
+        left_path = self.left_edit.text().strip()
+        right_path = self.right_edit.text().strip()
+
+        if not left_path or not right_path:
+            QMessageBox.warning(self, "提示", "请先选择源路径和目标路径")
+            return
+
+        if not Path(left_path).is_dir():
+            QMessageBox.warning(self, "提示", f"左侧路径不是有效目录：\n{left_path}")
+            return
+
+        if not Path(right_path).is_dir():
+            QMessageBox.warning(self, "提示", f"右侧路径不是有效目录：\n{right_path}")
+            return
+
+        if left_path == right_path:
+            QMessageBox.warning(self, "提示", "源路径和目标路径不能相同")
+            return
+
+        if self.watch_thread and self.watch_thread.isRunning():
+            return
+
+        if not self.current_diffs:
+            self.status_label.setText("首次启动监控，正在执行初始扫描 ...")
+            self._auto_sync_active = True
+            self.btn_start_watch.setEnabled(False)
+            self.btn_stop_watch.setEnabled(True)
+            self._update_watch_status_label("正在初始化...", "init")
+
+            self._auto_sync_pending_start = True
+            self.scan_thread = ScanThread(left_path, right_path)
+            self.scan_thread.progress.connect(self.on_scan_progress)
+            self.scan_thread.status_changed.connect(self.on_status_changed)
+            self.scan_thread.scan_complete.connect(self._on_initial_scan_complete)
+            self.scan_thread.start()
+            return
+
+        self._start_watch_internal(left_path)
+
+    def _start_watch_internal(self, left_path: str):
+        self._auto_sync_active = True
+        self.watch_thread = WatchThread(left_path)
+        self.watch_thread.changes_detected.connect(self.on_changes_detected)
+        self.watch_thread.status_changed.connect(self.on_status_changed)
+        self.watch_thread.watch_started.connect(self.on_watch_started)
+        self.watch_thread.watch_stopped.connect(self.on_watch_stopped)
+        self.watch_thread.start()
+
+        self.btn_start_watch.setEnabled(False)
+        self.btn_stop_watch.setEnabled(True)
+
+    def _on_initial_scan_complete(self, diffs: list):
+        self.progress_bar.setVisible(False)
+        self.btn_scan.setEnabled(True)
+        self.btn_cancel_scan.setEnabled(False)
+        self.current_diffs = diffs
+        self._populate_table(diffs)
+
+        if diffs:
+            identical = sum(1 for d in diffs if d.status == DiffItem.STATUS_IDENTICAL)
+            different = len(diffs) - identical
+            pending_sync = sum(1 for d in diffs if d.status in (
+                DiffItem.STATUS_LEFT_ONLY,
+                DiffItem.STATUS_DIFF_SIZE,
+                DiffItem.STATUS_DIFF_TIME,
+                DiffItem.STATUS_DIFF_BOTH
+            ))
+            self.sync_info_label.setText(
+                f"初始扫描完成：共 {len(diffs)} 项，待同步 {pending_sync} 项（左→右）。"
+            )
+            self.overall_count_label.setText(f"待同步：{pending_sync} 个")
+            if pending_sync > 0:
+                self.btn_start_sync.setEnabled(True)
+
+        left_path = self.left_edit.text().strip()
+        self._start_watch_internal(left_path)
+
+    def stop_watch(self):
+        if not self.watch_thread or not self.watch_thread.isRunning():
+            self._auto_sync_active = False
+            self.btn_start_watch.setEnabled(True)
+            self.btn_stop_watch.setEnabled(False)
+            self._update_watch_status_label("未开启", "off")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认停止",
+            "确定要停止自动同步监控吗？源目录的变化将不再自动同步。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._auto_sync_active = False
+        self.watch_thread.stop()
+        self.btn_start_watch.setEnabled(False)
+        self.btn_stop_watch.setEnabled(False)
+
+    def on_watch_started(self):
+        self._update_watch_status_label("监控中", "active")
+
+    def on_watch_stopped(self):
+        self.btn_start_watch.setEnabled(True)
+        self.btn_stop_watch.setEnabled(False)
+        self._update_watch_status_label("未开启", "off")
+
+    def _update_watch_status_label(self, text: str, state: str):
+        full_text = f"自动同步：{text}"
+        if state == "active":
+            style = """
+                padding: 6px 14px;
+                border-radius: 4px;
+                background-color: #d4edda;
+                color: #155724;
+                font-weight: bold;
+                border: 1px solid #28a745;
+            """
+        elif state == "init":
+            style = """
+                padding: 6px 14px;
+                border-radius: 4px;
+                background-color: #fff3cd;
+                color: #856404;
+                font-weight: bold;
+                border: 1px solid #ffc107;
+            """
+        elif state == "syncing":
+            style = """
+                padding: 6px 14px;
+                border-radius: 4px;
+                background-color: #cce5ff;
+                color: #004085;
+                font-weight: bold;
+                border: 1px solid #007bff;
+            """
+        else:
+            style = """
+                padding: 6px 14px;
+                border-radius: 4px;
+                background-color: #e0e0e0;
+                color: #555;
+                font-weight: bold;
+            """
+        self.watch_status_label.setText(full_text)
+        self.watch_status_label.setStyleSheet(style)
+
+    def on_changes_detected(self, changed_paths: list):
+        if not self._auto_sync_active:
+            return
+
+        self._pending_auto_sync_paths = changed_paths
+
+        left_path = self.left_edit.text().strip()
+        right_path = self.right_edit.text().strip()
+
+        self.status_label.setText(
+            f"检测到 {len(changed_paths)} 个文件变化，正在重新扫描差异 ..."
+        )
+        self._update_watch_status_label("同步中", "syncing")
+
+        self.scan_thread = ScanThread(left_path, right_path)
+        self.scan_thread.progress.connect(self.on_scan_progress)
+        self.scan_thread.status_changed.connect(self.on_status_changed)
+        self.scan_thread.scan_complete.connect(self._on_auto_scan_complete)
+        self.scan_thread.start()
+
+    def _on_auto_scan_complete(self, diffs: list):
+        self.progress_bar.setVisible(False)
+        self.btn_scan.setEnabled(True)
+        self.btn_cancel_scan.setEnabled(False)
+        self.current_diffs = diffs
+        self._populate_table(diffs)
+
+        pending_paths = self._pending_auto_sync_paths or []
+        self._pending_auto_sync_paths = None
+
+        if not pending_paths:
+            self._update_watch_status_label("监控中", "active")
+            return
+
+        affected_diffs = [
+            d for d in diffs if d.rel_path in pending_paths
+        ]
+
+        pending_sync = sum(1 for d in affected_diffs if d.status in (
+            DiffItem.STATUS_LEFT_ONLY,
+            DiffItem.STATUS_DIFF_SIZE,
+            DiffItem.STATUS_DIFF_TIME,
+            DiffItem.STATUS_DIFF_BOTH
+        ))
+
+        if pending_sync == 0:
+            self.status_label.setText(
+                f"扫描完成：监控的 {len(pending_paths)} 个文件无需同步"
+            )
+            self._update_watch_status_label("监控中", "active")
+            return
+
+        left_path = self.left_edit.text().strip()
+        right_path = self.right_edit.text().strip()
+
+        self.btn_start_sync.setEnabled(False)
+        self.btn_cancel_sync.setEnabled(False)
+        self.btn_scan.setEnabled(False)
+
+        self.sync_thread = SyncThread(
+            left_path, right_path, diffs,
+            only_paths=pending_paths
+        )
+        self.sync_thread.task_list_ready.connect(self.on_sync_task_list_ready)
+        self.sync_thread.file_started.connect(self.on_sync_file_started)
+        self.sync_thread.file_progress.connect(self.on_sync_file_progress)
+        self.sync_thread.file_finished.connect(self.on_sync_file_finished)
+        self.sync_thread.overall_progress.connect(self.on_sync_overall_progress)
+        self.sync_thread.sync_complete.connect(self._on_auto_sync_complete)
+        self.sync_thread.status_changed.connect(self.on_status_changed)
+        self.sync_thread.start()
+
+    def _on_auto_sync_complete(self, synced: int, failed: int, skipped: int):
+        self.btn_start_sync.setEnabled(True)
+        self.btn_cancel_sync.setEnabled(False)
+        self.btn_scan.setEnabled(True)
+
+        total = synced + failed + skipped
+        self.status_label.setText(
+            f"自动同步完成：成功 {synced} / 失败 {failed} / 跳过 {skipped}（共 {total} 个）"
+        )
+
+        if self._auto_sync_active:
+            self._update_watch_status_label("监控中", "active")
 
     def on_sync_task_list_ready(self, tasks: list):
         self.sync_tasks = tasks

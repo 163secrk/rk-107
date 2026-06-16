@@ -1,12 +1,12 @@
 import os
-import shutil
 from pathlib import Path
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import List, Optional, Set
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from scanner import DiffItem, FileInfo
+from watch_thread import SyncEventTracker
 
 
 @dataclass
@@ -40,14 +40,17 @@ class SyncThread(QThread):
         left_path: str,
         right_path: str,
         diffs: List[DiffItem],
+        only_paths: Optional[List[str]] = None,
         parent=None
     ):
         super().__init__(parent)
         self.left_path = Path(left_path)
         self.right_path = Path(right_path)
         self.diffs = diffs
+        self.only_paths: Optional[Set[str]] = set(only_paths) if only_paths else None
         self._cancel = False
         self.tasks: List[SyncTask] = []
+        self._tracker = SyncEventTracker.get_instance()
 
     def cancel(self):
         self._cancel = True
@@ -61,6 +64,9 @@ class SyncThread(QThread):
         for diff in self.diffs:
             if self._cancel:
                 break
+
+            if self.only_paths is not None and diff.rel_path not in self.only_paths:
+                continue
 
             if diff.status in (
                 DiffItem.STATUS_LEFT_ONLY,
@@ -90,26 +96,36 @@ class SyncThread(QThread):
         source = task.source_path
         target = task.target_path
 
-        target.parent.mkdir(parents=True, exist_ok=True)
+        self._tracker.mark_syncing(target)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self._tracker.mark_syncing(target.parent)
 
-        total = task.size
-        copied = 0
+            total = task.size
+            copied = 0
 
-        with open(source, "rb") as fsrc:
-            with open(target, "wb") as fdst:
-                while True:
-                    if self._cancel:
-                        raise InterruptedError("用户取消同步")
+            with open(source, "rb") as fsrc:
+                with open(target, "wb") as fdst:
+                    while True:
+                        if self._cancel:
+                            raise InterruptedError("用户取消同步")
 
-                    chunk = fsrc.read(chunk_size)
-                    if not chunk:
-                        break
-                    fdst.write(chunk)
-                    copied += len(chunk)
-                    self.file_progress.emit(task.index, copied)
+                        chunk = fsrc.read(chunk_size)
+                        if not chunk:
+                            break
+                        fdst.write(chunk)
+                        copied += len(chunk)
+                        self.file_progress.emit(task.index, copied)
 
-        stat = source.stat()
-        os.utime(target, (stat.st_atime, stat.st_mtime))
+            stat = source.stat()
+            os.utime(target, (stat.st_atime, stat.st_mtime))
+
+            self._tracker.unmark_syncing(target)
+            self._tracker.unmark_syncing(target.parent)
+        except Exception:
+            self._tracker.unmark_syncing(target)
+            self._tracker.unmark_syncing(target.parent)
+            raise
 
     def run(self):
         self._cancel = False
