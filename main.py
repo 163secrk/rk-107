@@ -526,16 +526,17 @@ class MainWindow(QMainWindow):
         self.btn_run_selected.setMinimumHeight(42)
         self.btn_run_selected.setStyleSheet("""
             QPushButton {
-                background: linear-gradient(135deg, #218838 0%, #28a745 100%);
+                background-color: #28a745;
                 color: white;
-                border: none;
+                border: 1px solid #218838;
                 border-radius: 8px;
                 padding: 10px 32px;
                 font-weight: bold;
                 font-size: 15px;
             }
-            QPushButton:hover { background: linear-gradient(135deg, #2e9e47 0%, #34ce57 100%); }
-            QPushButton:disabled { background: #a0a0a0; }
+            QPushButton:hover { background-color: #2e9e47; }
+            QPushButton:disabled { background-color: #a0a0a0; border-color: #888; }
+            QPushButton:pressed { background-color: #1e7e34; }
         """)
         self.btn_run_selected.clicked.connect(self.run_selected_profiles)
         exec_btn_row.addWidget(self.btn_run_selected, stretch=1)
@@ -545,16 +546,17 @@ class MainWindow(QMainWindow):
         self.btn_stop_scheduler.setEnabled(False)
         self.btn_stop_scheduler.setStyleSheet("""
             QPushButton {
-                background: linear-gradient(135deg, #c82333 0%, #dc3545 100%);
+                background-color: #dc3545;
                 color: white;
-                border: none;
+                border: 1px solid #c82333;
                 border-radius: 8px;
                 padding: 10px 28px;
                 font-weight: bold;
                 font-size: 15px;
             }
-            QPushButton:hover { background: linear-gradient(135deg, #e04454 0%, #f06570 100%); }
-            QPushButton:disabled { background: #a0a0a0; }
+            QPushButton:hover { background-color: #e04454; }
+            QPushButton:disabled { background-color: #a0a0a0; border-color: #888; }
+            QPushButton:pressed { background-color: #bd2130; }
         """)
         self.btn_stop_scheduler.clicked.connect(self.stop_scheduler)
         exec_btn_row.addWidget(self.btn_stop_scheduler)
@@ -608,16 +610,17 @@ class MainWindow(QMainWindow):
         self.btn_open_report.setEnabled(False)
         self.btn_open_report.setStyleSheet("""
             QPushButton {
-                background: linear-gradient(135deg, #6f42c1 0%, #8b5cf6 100%);
+                background-color: #8b5cf6;
                 color: white;
-                border: none;
+                border: 1px solid #6f42c1;
                 border-radius: 6px;
                 padding: 8px 24px;
                 font-weight: bold;
                 font-size: 14px;
             }
-            QPushButton:hover { background: linear-gradient(135deg, #8b5cf6 0%, #a78bfa 100%); }
-            QPushButton:disabled { background: #a0a0a0; }
+            QPushButton:hover { background-color: #a78bfa; }
+            QPushButton:disabled { background-color: #a0a0a0; border-color: #888; }
+            QPushButton:pressed { background-color: #6f42c1; }
         """)
         self.btn_open_report.clicked.connect(self.open_latest_report)
         report_btn_row.addWidget(self.btn_open_report)
@@ -1594,8 +1597,8 @@ class MainWindow(QMainWindow):
                     pct = int(copied_bytes / total * 100)
                 else:
                     pct = 100
-                file_bar.setRange(0, total)
-                file_bar.setValue(copied_bytes)
+                file_bar.setRange(0, 100)
+                file_bar.setValue(pct)
                 file_bar.setFormat(
                     f"{format_size(copied_bytes)}/{format_size(total)} ({pct}%)"
                 )
@@ -1617,7 +1620,7 @@ class MainWindow(QMainWindow):
             file_bar = self.table.cellWidget(row, self.COL_SYNC_PROGRESS)
             if file_bar and isinstance(file_bar, QProgressBar) and task:
                 if status == SyncTask.STATUS_SYNCED:
-                    file_bar.setValue(task.size)
+                    file_bar.setValue(100)
                     file_bar.setFormat(f"✓ {format_size(task.size)} (100%)")
                 elif status == SyncTask.STATUS_FAILED:
                     file_bar.setFormat(f"✗ 失败: {error_msg[:30]}")
