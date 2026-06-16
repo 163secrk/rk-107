@@ -633,7 +633,7 @@ class MainWindow(QMainWindow):
 
         right_layout.addWidget(exec_group, stretch=1)
         top_splitter.addWidget(right_panel)
-        top_splitter.setSizes([1, 1.3])
+        top_splitter.setSizes([1, 2])
 
         layout.addWidget(top_splitter, stretch=1)
         self.last_report_path = None
